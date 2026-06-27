@@ -1,97 +1,102 @@
+"""ml-engine: análise estatística do histórico de sorteios.
+
+Lê o histórico do S3 (results/{concurso}_{loteria}.json), calcula estatísticas por
+modalidade (frequência, quente/frio, atraso, pares/ímpares, soma), gera sugestões de
+jogos e grava no DynamoDB (item LATEST_PREDICTION) junto com os últimos resultados.
+
+Disclaimer: loteria é evento independente — as sugestões são informativas e não
+aumentam as chances reais de premiação.
+"""
 import json
-import boto3
 import os
-import random
-from collections import Counter
+import re
+import logging
+from collections import defaultdict
+from datetime import datetime, timezone
+from decimal import Decimal
 
-s3_client = boto3.client('s3')
-dynamodb = boto3.resource('dynamodb')
+import boto3
 
-BUCKET_NAME = os.getenv('S3_BUCKET', 'loterias-resultados')
-TABLE_NAME = os.getenv('DYNAMO_TABLE', 'LoteriasPredictiveData')
+from stats import (
+    GAME_CONFIG, frequency, hot_cold, atraso, pares_impares_media, soma_media, build_suggestions,
+)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+
+BUCKET = os.getenv("S3_BUCKET", "loterias-resultados")
+TABLE = os.getenv("DYNAMO_TABLE", "LoteriasPredictiveData")
+PREFIX = os.getenv("S3_PREFIX", "results/")
+
+FILENAME_RE = re.compile(r"(\d+)_(megasena|lotofacil|lotomania)\.json$")
+APINAME_TO_KEY = {"megasena": "mega-sena", "lotofacil": "lotofacil", "lotomania": "lotomania"}
+
+
+def _load_history():
+    """Retorna {apiname: [(concurso:int, dezenas:[int]), ...]} lido do S3."""
+    per = defaultdict(list)
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
+        for obj in page.get("Contents", []):
+            m = FILENAME_RE.search(obj["Key"])
+            if not m:
+                continue
+            concurso, loteria = int(m.group(1)), m.group(2)
+            try:
+                body = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
+                dezenas = [int(x) for x in json.loads(body)["dezenas"]]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Ignorando %s: %s", obj["Key"], e)
+                continue
+            per[loteria].append((concurso, dezenas))
+    return per
+
 
 def lambda_handler(event, context):
-    print("Iniciando processamento preditivo...")
-    
-    # 1. Fetch historical data from S3
-    try:
-        response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, MaxKeys=500)
-    except Exception as e:
-        print(f"Erro ao acessar S3: {e}")
-        return {"statusCode": 500, "body": "Erro ao acessar S3"}
+    history = _load_history()
+    suggestions, stats, latest = {}, {}, {}
 
-    if 'Contents' not in response:
-        return {"statusCode": 200, "body": "Nenhum dado encontrado no S3."}
+    for loteria, entries in history.items():
+        key = APINAME_TO_KEY[loteria]
+        cfg = GAME_CONFIG[key]
+        entries.sort(key=lambda e: e[0])  # por concurso (asc)
+        draws = [dezenas for _, dezenas in entries]
 
-    all_drawn_numbers = []
-    
-    # 2. Extract valid drawn numbers
-    for obj in response['Contents']:
-        key = obj['Key']
-        try:
-            file_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
-            content = file_obj['Body'].read().decode('utf-8')
-            data = json.loads(content)
-            
-            payload = data.get('Payload', {})
-            # Em caso de Step Functions Payload aninhado
-            if 'Payload' in payload:
-                payload = payload['Payload']
-                
-            if payload.get('code') == 200 and 'Dezenas Sorteadas' in payload:
-                # payload example {"code": 200, "Dezenas Sorteadas": ["01", "15", "23", "45", "50", "59"]}
-                dezenas = payload['Dezenas Sorteadas']
-                all_drawn_numbers.extend(dezenas)
-        except Exception as e:
-            # Ignora arquivos inválidos ou com erro
-            continue
-            
-    if not all_drawn_numbers:
-        print("Nenhum dado histórico válido encontrado. Usando fallback.")
-        # Fallback fictício para demonstração
-        all_drawn_numbers = [f"{random.randint(1, 60):02d}" for _ in range(1000)]
+        freq = frequency(draws)
+        hot, cold = hot_cold(freq, cfg["min"], cfg["max"])
+        atr = atraso(draws, cfg["min"], cfg["max"])
+        top_atraso = sorted(atr.items(), key=lambda kv: kv[1], reverse=True)[:10]
 
-    # 3. Frequency Analysis
-    counter = Counter(all_drawn_numbers)
-    most_common = [num for num, count in counter.most_common(15)]
-    least_common = [num for num, count in counter.most_common()[-10:]]
+        suggestions[key] = build_suggestions(freq, cfg, count=5)
+        stats[key] = {
+            "hot_numbers": hot,
+            "cold_numbers": cold,
+            "atraso": [{"dezena": n, "concursos": d} for n, d in top_atraso],
+            "pares_impares": pares_impares_media(draws),
+            "soma_media": soma_media(draws),
+            "total_concursos": len(draws),
+        }
+        last_concurso, last_dezenas = entries[-1]
+        latest[key] = {"concurso": last_concurso, "dezenas": sorted(last_dezenas)}
+        logger.info("%s: %d concursos analisados", key, len(draws))
 
-    # 4. Generate Predictive Games (Heuristic Model: 4 Hot + 2 Cold for Mega-Sena)
-    predictions = {
-        "mega-sena": [],
-        "lotofacil": [],
-        "lotomania": []
+    if not suggestions:
+        logger.warning("Nenhum histórico encontrado em s3://%s/%s", BUCKET, PREFIX)
+        return {"statusCode": 200, "body": "Sem dados históricos."}
+
+    item = {
+        "id": "LATEST_PREDICTION",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "suggestions": suggestions,
+        "stats": stats,
+        "latest_results": latest,
     }
-    
-    # Generating 5 high-probability suggestions for Mega-Sena
-    for _ in range(5):
-        hot_picks = random.sample(most_common, min(4, len(most_common)))
-        cold_picks = random.sample(least_common, min(2, len(least_common)))
-        game = sorted(hot_picks + cold_picks)
-        predictions["mega-sena"].append(game)
+    # DynamoDB não aceita float -> converte para Decimal
+    item = json.loads(json.dumps(item), parse_float=Decimal)
+    dynamodb.Table(TABLE).put_item(Item=item)
 
-    # (Lógica similar seria aplicada para lotofacil e lotomania)
-    
-    # 5. Save to DynamoDB
-    try:
-        table = dynamodb.Table(TABLE_NAME)
-        table.put_item(
-            Item={
-                'id': 'LATEST_PREDICTION',
-                'timestamp': 'CURRENT_TIMESTAMP', # idealmente datetime.now().isoformat()
-                'suggestions': predictions,
-                'stats': {
-                    'hot_numbers': most_common[:10],
-                    'cold_numbers': least_common[:5]
-                }
-            }
-        )
-        print("Predições salvas no DynamoDB com sucesso!")
-    except Exception as e:
-        print(f"Erro ao salvar no DynamoDB: {e}")
-        return {"statusCode": 500, "body": "Erro no Banco de Dados"}
-
-    return {
-        "statusCode": 200,
-        "body": json.dumps("Análise Preditiva concluída e salva com sucesso!")
-    }
+    logger.info("Predição salva: %s", {k: len(v) for k, v in suggestions.items()})
+    return {"statusCode": 200, "body": json.dumps("Análise concluída.")}
